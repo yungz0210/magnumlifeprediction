@@ -154,7 +154,6 @@ def ensemble_predictions(preds_dict, strategy="vote", n_numbers=50, k=6):
     for probs in preds_dict.values():
         top = np.argsort(probs)[-k:]
         all_preds.append(top)
-
     if strategy=="vote":
         flat = [num for arr in all_preds for num in arr]
         counter = Counter(flat)
@@ -163,32 +162,77 @@ def ensemble_predictions(preds_dict, strategy="vote", n_numbers=50, k=6):
         avg_probs = np.mean(list(preds_dict.values()), axis=0)
         return sorted([int(x)+1 for x in np.argsort(avg_probs)[-k:]])
 
-# ✅ Constrain predictions into valid range
+# =============================
+# Constrain predictions into valid range (deduplicated + padded)
+# - This is where duplicates are removed and the list is padded to the required length (k)
+# - Works with nested/array-like preds and handles np.int64 etc.
+# =============================
 def constrain_predictions(preds, game):
-    ranges = {
-        "Star 6/50": 50,
-        "Power 6/55": 55,
-        "Supreme 6/58": 58,
-        "Magnum Life": 36
-    }
+    ranges = {"Star 6/50": 50, "Power 6/55": 55, "Supreme 6/58": 58, "Magnum Life": 36}
     max_num = ranges[game]
-    return sorted([int(x) % max_num + 1 for x in preds])
+    k = 6 if game != "Magnum Life" else 8
+
+    seen = set()
+    unique = []
+
+    # Flatten preds safely (handles arrays/lists etc)
+    try:
+        iterator = np.asarray(preds).ravel()
+    except Exception:
+        # fallback to simple iterable
+        iterator = preds
+
+    for item in iterator:
+        # If nested (e.g., an array inside), flatten that element too
+        if isinstance(item, (list, tuple, np.ndarray)):
+            for sub in np.asarray(item).ravel():
+                try:
+                    val = int(sub) % max_num + 1
+                except Exception:
+                    continue
+                if val not in seen:
+                    seen.add(val)
+                    unique.append(val)
+                    if len(unique) == k:
+                        break
+            if len(unique) == k:
+                break
+        else:
+            try:
+                val = int(item) % max_num + 1
+            except Exception:
+                continue
+            if val not in seen:
+                seen.add(val)
+                unique.append(val)
+                if len(unique) == k:
+                    break
+
+    # Pad if still short
+    while len(unique) < k:
+        val = random.randint(1, max_num)
+        if val not in seen:
+            unique.append(val)
+            seen.add(val)
+
+    return sorted(unique)
 
 def hybrid_ensemble(preds_dict, numbers, n_numbers=50, k=6):
     """
     Hybrid Ensemble (Option B):
     - Combines ML ensemble (vote) with Markov frequency
+    - preserves order and enforces uniqueness, pads if necessary
     """
     ml_pred = ensemble_predictions(preds_dict, "vote", n_numbers, k)
     markov_pred = markov_prediction(numbers, n_numbers, k, "freq")
-    combined = list(set(ml_pred + markov_pred))
-    # Ensure correct length k
-    if len(combined) > k:
-        combined = combined[:k]
-    elif len(combined) < k:
-        # Pad with random valid numbers
-        combined += random.sample(range(1, n_numbers+1), k - len(combined))
-    return sorted(combined)
+    # preserve order while deduplicating
+    combined = list(dict.fromkeys(list(ml_pred) + list(markov_pred)))
+    # ensure length k (pad with distinct randoms if needed)
+    while len(combined) < k:
+        candidate = random.randint(1, n_numbers)
+        if candidate not in combined:
+            combined.append(candidate)
+    return sorted(combined[:k])
 
 # =============================
 # App
@@ -259,14 +303,14 @@ for game, tab in zip(GAME_LINKS.keys(), [tab4, tab2, tab3, tab1]):
             "Hybrid Ensemble (ML + Markov)" : hybrid_ensemble(preds_dict, numbers, n_numbers, k)
         }
 
-        # ✅ Apply range constraint + int cast
+        # ✅ Apply range constraint + uniqueness fix
         predictions = {name: constrain_predictions(pred, game) for name, pred in raw_predictions.items()}
 
         for model_name, pred in predictions.items():
             st.write(f"{model_name}: {pred}")
 
 # =============================
-# Bonus handling (dynamic)
+# Bonus handling (dynamic, deduplicated)
 # =============================
         bonus_predictions = None
         if bonus_col is not None:
@@ -275,18 +319,33 @@ for game, tab in zip(GAME_LINKS.keys(), [tab4, tab2, tab3, tab1]):
                 bonus_vals = df[bonus_col].dropna().astype(int).tolist()
                 if bonus_vals:
                     bonus_pred = Counter(bonus_vals).most_common(1)[0][0]
-                    st.write(f"Most frequent Bonus Prediction: {bonus_pred}")
-                    bonus_predictions = [bonus_pred]
+                    bonus_predictions = [int(bonus_pred)]
+                    st.write(f"Most frequent Bonus Prediction: {bonus_predictions}")
             elif isinstance(bonus_col, list):  # Multiple bonus columns (Magnum Life)
-                bonus_predictions = []
-                detected_bonus = []
+                # collect across both bonus columns (if available)
+                all_bonuses = []
                 for col in bonus_col:
                     if col in df.columns:
-                        vals = df[col].dropna().astype(int).tolist()
-                        if vals:
-                            detected_bonus.append(Counter(vals).most_common(1)[0][0])
-                if detected_bonus:
-                    bonus_predictions = detected_bonus
+                        all_bonuses += df[col].dropna().astype(int).tolist()
+                if all_bonuses:
+                    counts = Counter(all_bonuses)
+                    # take the most common unique bonus numbers up to the number of bonus cols
+                    candidate_bonuses = [num for num, _ in counts.most_common(len(bonus_col)*2)]
+                    # deduplicate while preserving order
+                    deduped = list(dict.fromkeys(candidate_bonuses))
+                    # ensure length equals number of bonus columns; pad randomly if needed
+                    needed = len(bonus_col)
+                    ranges = {"Star 6/50": 50, "Power 6/55": 55, "Supreme 6/58": 58, "Magnum Life": 36}
+                    max_bonus = ranges[game]
+                    i = 0
+                    while len(deduped) < needed:
+                        cand = random.randint(1, max_bonus)
+                        if cand not in deduped:
+                            deduped.append(cand)
+                        i += 1
+                        if i > 1000:
+                            break
+                    bonus_predictions = sorted(deduped[:needed])
                     st.write(f"Predicted Bonus Numbers: {bonus_predictions}")
 
         # Export predictions
